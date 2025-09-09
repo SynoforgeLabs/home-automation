@@ -62,12 +62,25 @@ mqttClient.on('reconnect', () => {
 
 mqttClient.on('message', (topic, message) => {
   try {
-    const data = JSON.parse(message.toString());
+    const messageStr = message.toString();
+    
+    // Skip non-JSON messages (common on public MQTT brokers)
+    if (!messageStr.startsWith('{') && !messageStr.startsWith('[')) {
+      console.log(`Skipping non-JSON message [${topic}]: ${messageStr}`);
+      return;
+    }
+    
+    const data = JSON.parse(messageStr);
     const topicParts = topic.split('/');
     const deviceId = topicParts[1];
     const messageType = topicParts[2];
     
-    console.log(`MQTT Message [${topic}]:`, data);
+    // Only log messages from our expected device or show count for others
+    if (deviceId === 'esp32-light-controller') {
+      console.log(`📡 MQTT Message [${topic}]:`, data);
+    } else {
+      console.log(`🌍 Other device message [${topic}]: ${Object.keys(data).join(', ')}`);
+    }
     
     switch (messageType) {
       case 'heartbeat':
