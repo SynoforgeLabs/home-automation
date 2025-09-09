@@ -3,7 +3,7 @@ const cors = require('cors');
 const axios = require('axios');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3005;
 const HOST = process.env.HOST || '0.0.0.0'; // Allow external connections for VPS
 
 // Middleware
