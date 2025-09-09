@@ -1,96 +1,224 @@
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
+const mqtt = require('mqtt');
 
 const app = express();
 const PORT = process.env.PORT || 3005;
 const HOST = process.env.HOST || '0.0.0.0'; // Allow external connections for VPS
 
+// MQTT Configuration
+const MQTT_BROKER = process.env.MQTT_BROKER || 'mqtt://broker.hivemq.com:1883';
+const MQTT_TOPICS = {
+  DEVICE_HEARTBEAT: 'devices/+/heartbeat',
+  DEVICE_STATUS: 'devices/+/status', 
+  DEVICE_RESPONSES: 'devices/+/responses',
+  DEVICE_COMMANDS: 'devices/esp32-light-controller/commands'
+};
+
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-// Store registered ESP32 devices
+// Store registered ESP32 devices and pending requests
 const devices = new Map();
+const pendingRequests = new Map();
 
-console.log('ESP32 Bridge Server starting...');
+console.log('ESP32 MQTT Bridge Server starting...');
 console.log(`HTTP API will be available on port ${PORT}`);
+console.log(`Connecting to MQTT broker: ${MQTT_BROKER}`);
 
-// Device registration endpoint (replaces WebSocket registration)
-app.post('/api/devices/register', (req, res) => {
-  try {
-    const { deviceId, name, ip, port } = req.body;
-    
-    if (!deviceId || !ip) {
-      return res.status(400).json({ error: 'deviceId and ip are required' });
-    }
-    
-    const deviceInfo = {
-      id: deviceId,
-      name: name || 'ESP32 Device',
-      ip: ip,
-      port: port || 80,
-      lastSeen: new Date(),
-      status: 'online'
-    };
-    
-    devices.set(deviceId, deviceInfo);
-    console.log(`Device registered: ${deviceId} at ${ip}:${port || 80}`);
-    
-    res.json({
-      message: 'Device registered successfully',
-      deviceId: deviceId
-    });
-  } catch (error) {
-    console.error('Error registering device:', error);
-    res.status(500).json({ error: 'Registration failed' });
-  }
+// Initialize MQTT client
+const mqttClient = mqtt.connect(MQTT_BROKER, {
+  clientId: `bridge-server-${Date.now()}`,
+  keepalive: 60,
+  reconnectPeriod: 1000,
+  clean: true
 });
 
-// Device heartbeat endpoint (replaces WebSocket heartbeat)
-app.post('/api/devices/:deviceId/heartbeat', (req, res) => {
-  const deviceId = req.params.deviceId;
-  const device = devices.get(deviceId);
+mqttClient.on('connect', () => {
+  console.log('✓ Connected to MQTT broker');
   
-  if (device) {
-    const previousStatus = device.status;
-    device.lastSeen = new Date();
-    device.status = 'online';
-    
-    if (previousStatus !== 'online') {
-      console.log(`✓ Device ${deviceId} is back online (was ${previousStatus})`);
-    } else {
-      console.log(`♡ Heartbeat received from ${deviceId}`);
+  // Subscribe to all device topics
+  Object.values(MQTT_TOPICS).forEach(topic => {
+    if (topic.includes('+')) { // Wildcard topics
+      mqttClient.subscribe(topic, (err) => {
+        if (err) {
+          console.error(`Failed to subscribe to ${topic}:`, err);
+        } else {
+          console.log(`Subscribed to: ${topic}`);
+        }
+      });
     }
+  });
+});
+
+mqttClient.on('error', (error) => {
+  console.error('MQTT connection error:', error);
+});
+
+mqttClient.on('reconnect', () => {
+  console.log('Reconnecting to MQTT broker...');
+});
+
+mqttClient.on('message', (topic, message) => {
+  try {
+    const data = JSON.parse(message.toString());
+    const topicParts = topic.split('/');
+    const deviceId = topicParts[1];
+    const messageType = topicParts[2];
     
-    res.json({ 
-      message: 'Heartbeat received',
-      deviceStatus: device.status,
-      timestamp: device.lastSeen
-    });
-  } else {
-    console.log(`✗ Heartbeat from unknown device: ${deviceId}`);
-    res.status(404).json({ error: 'Device not found' });
+    console.log(`MQTT Message [${topic}]:`, data);
+    
+    switch (messageType) {
+      case 'heartbeat':
+        handleHeartbeat(deviceId, data);
+        break;
+      case 'status':
+        handleStatusUpdate(deviceId, data);
+        break;
+      case 'responses':
+        handleCommandResponse(deviceId, data);
+        break;
+      default:
+        console.log(`Unknown message type: ${messageType}`);
+    }
+  } catch (error) {
+    console.error('Error parsing MQTT message:', error);
   }
 });
+
+// Handle device heartbeat/registration
+function handleHeartbeat(deviceId, data) {
+  const now = new Date();
+  const existingDevice = devices.get(deviceId);
+  
+  const deviceInfo = {
+    id: deviceId,
+    name: data.name || deviceId,
+    ip: data.ip,
+    status: data.status || 'on',
+    lastSeen: now,
+    online: true,
+    relayPin: data.relay_pin
+  };
+  
+  devices.set(deviceId, deviceInfo);
+  
+  if (data.type === 'registration') {
+    console.log(`📝 Device registered: ${deviceId} (${data.name}) at ${data.ip}`);
+  } else if (!existingDevice || !existingDevice.online) {
+    console.log(`✓ Device ${deviceId} is online`);
+  } else {
+    console.log(`♡ Heartbeat from ${deviceId}`);
+  }
+}
+
+// Handle status updates from devices
+function handleStatusUpdate(deviceId, data) {
+  const device = devices.get(deviceId);
+  if (device) {
+    device.status = data.status;
+    device.lastSeen = new Date();
+    console.log(`📊 Status update from ${deviceId}: ${data.status}`);
+  }
+}
+
+// Handle command responses from devices
+function handleCommandResponse(deviceId, data) {
+  const requestId = data.requestId;
+  if (requestId && pendingRequests.has(requestId)) {
+    const { res, timeout } = pendingRequests.get(requestId);
+    clearTimeout(timeout);
+    pendingRequests.delete(requestId);
+    
+    if (data.success) {
+      res.json({
+        device: {
+          id: deviceId,
+          status: data.status
+        },
+        command: data.command,
+        timestamp: data.timestamp,
+        success: true
+      });
+    } else {
+      res.status(500).json({
+        error: 'Command failed',
+        details: data.error || 'Unknown error'
+      });
+    }
+    
+    console.log(`📤 Command response sent for request ${requestId}: ${data.success ? 'success' : 'failed'}`);
+  } else {
+    console.log(`⚠ Received response for unknown request: ${requestId}`);
+  }
+}
+
+// Send MQTT command to device
+function sendMQTTCommand(deviceId, command, res, timeout = 10000) {
+  const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  
+  const commandMessage = {
+    command: command,
+    requestId: requestId,
+    timestamp: Date.now()
+  };
+  
+  const topic = `devices/${deviceId}/commands`;
+  
+  // Store pending request
+  const timeoutId = setTimeout(() => {
+    if (pendingRequests.has(requestId)) {
+      pendingRequests.delete(requestId);
+      res.status(504).json({ 
+        error: 'Request timeout',
+        details: `Device did not respond within ${timeout/1000} seconds`
+      });
+    }
+  }, timeout);
+  
+  pendingRequests.set(requestId, { res, timeout: timeoutId });
+  
+  // Publish command
+  mqttClient.publish(topic, JSON.stringify(commandMessage), (err) => {
+    if (err) {
+      clearTimeout(timeoutId);
+      pendingRequests.delete(requestId);
+      console.error(`Failed to send command to ${deviceId}:`, err);
+      res.status(500).json({ 
+        error: 'Failed to send command',
+        details: err.message 
+      });
+    } else {
+      console.log(`📤 Command sent to ${deviceId}: ${command} (Request ID: ${requestId})`);
+    }
+  });
+}
 
 // Clean up offline devices periodically
 setInterval(() => {
   const now = new Date();
-  const TIMEOUT = 45000; // 45 second timeout (3x heartbeat interval for better stability)
+  const TIMEOUT = 45000; // 45 second timeout (3x heartbeat interval)
   
   for (const [deviceId, device] of devices.entries()) {
     const timeSinceLastSeen = now - device.lastSeen;
-    if (timeSinceLastSeen > TIMEOUT && device.status === 'online') {
+    if (timeSinceLastSeen > TIMEOUT && device.online) {
       console.log(`⚠ Device ${deviceId} marked as offline (no heartbeat for ${Math.round(timeSinceLastSeen/1000)}s)`);
-      device.status = 'offline';
-    }
-    // Mark as error if offline for too long
-    else if (timeSinceLastSeen > TIMEOUT * 2 && device.status === 'offline') {
-      device.status = 'error';
+      device.online = false;
     }
   }
-}, 20000); // Check every 20 seconds (less frequent to reduce race conditions)
+}, 30000); // Check every 30 seconds
+
+// Clean up expired pending requests
+setInterval(() => {
+  const now = Date.now();
+  for (const [requestId, { timestamp }] of pendingRequests.entries()) {
+    if (timestamp && (now - timestamp) > 30000) { // 30 second cleanup
+      pendingRequests.delete(requestId);
+      console.log(`🧹 Cleaned up expired request: ${requestId}`);
+    }
+  }
+}, 60000); // Clean up every minute
 
 // REST API Routes
 
@@ -100,8 +228,8 @@ app.get('/api/devices', (req, res) => {
     id: d.id,
     name: d.name,
     ip: d.ip,
-    port: d.port,
     status: d.status,
+    online: d.online,
     lastSeen: d.lastSeen
   }));
   
@@ -109,7 +237,7 @@ app.get('/api/devices', (req, res) => {
 });
 
 // Get specific device status
-app.get('/api/devices/:deviceId/status', async (req, res) => {
+app.get('/api/devices/:deviceId/status', (req, res) => {
   const deviceId = req.params.deviceId;
   const device = devices.get(deviceId);
   
@@ -117,37 +245,16 @@ app.get('/api/devices/:deviceId/status', async (req, res) => {
     return res.status(404).json({ error: 'Device not found' });
   }
   
-  // Allow requests to devices marked as 'offline' but not 'error' (more forgiving)
-  if (device.status === 'error') {
+  if (!device.online) {
     return res.status(503).json({ error: 'Device is offline' });
   }
   
-  try {
-    // Forward request to ESP32 with longer timeout for better reliability
-    const response = await axios.get(`http://${device.ip}:${device.port}/status`, {
-      timeout: 5000
-    });
-    
-    res.json({
-      device: {
-        id: device.id,
-        name: device.name,
-        status: device.status
-      },
-      esp32: response.data
-    });
-  } catch (error) {
-    console.error(`Error getting status from ${deviceId}:`, error.message);
-    device.status = 'error';
-    res.status(503).json({ 
-      error: 'Failed to communicate with device',
-      details: error.message 
-    });
-  }
+  // Send get_status command via MQTT and wait for response
+  sendMQTTCommand(deviceId, 'get_status', res);
 });
 
 // Control device - turn on
-app.post('/api/devices/:deviceId/on', async (req, res) => {
+app.post('/api/devices/:deviceId/on', (req, res) => {
   const deviceId = req.params.deviceId;
   const device = devices.get(deviceId);
   
@@ -155,37 +262,16 @@ app.post('/api/devices/:deviceId/on', async (req, res) => {
     return res.status(404).json({ error: 'Device not found' });
   }
   
-  // Allow requests to devices marked as 'offline' but not 'error' (more forgiving)
-  if (device.status === 'error') {
+  if (!device.online) {
     return res.status(503).json({ error: 'Device is offline' });
   }
   
-  try {
-    // Forward request to ESP32 with longer timeout for better reliability
-    const response = await axios.post(`http://${device.ip}:${device.port}/on`, {}, {
-      timeout: 5000
-    });
-    
-    res.json({
-      device: {
-        id: device.id,
-        name: device.name,
-        status: device.status
-      },
-      esp32: response.data
-    });
-  } catch (error) {
-    console.error(`Error turning on ${deviceId}:`, error.message);
-    device.status = 'error';
-    res.status(503).json({ 
-      error: 'Failed to communicate with device',
-      details: error.message 
-    });
-  }
+  // Send turn_on command via MQTT and wait for response
+  sendMQTTCommand(deviceId, 'turn_on', res);
 });
 
 // Control device - turn off
-app.post('/api/devices/:deviceId/off', async (req, res) => {
+app.post('/api/devices/:deviceId/off', (req, res) => {
   const deviceId = req.params.deviceId;
   const device = devices.get(deviceId);
   
@@ -193,33 +279,12 @@ app.post('/api/devices/:deviceId/off', async (req, res) => {
     return res.status(404).json({ error: 'Device not found' });
   }
   
-  // Allow requests to devices marked as 'offline' but not 'error' (more forgiving)
-  if (device.status === 'error') {
+  if (!device.online) {
     return res.status(503).json({ error: 'Device is offline' });
   }
   
-  try {
-    // Forward request to ESP32 with longer timeout for better reliability
-    const response = await axios.post(`http://${device.ip}:${device.port}/off`, {}, {
-      timeout: 5000
-    });
-    
-    res.json({
-      device: {
-        id: device.id,
-        name: device.name,
-        status: device.status
-      },
-      esp32: response.data
-    });
-  } catch (error) {
-    console.error(`Error turning off ${deviceId}:`, error.message);
-    device.status = 'error';
-    res.status(503).json({ 
-      error: 'Failed to communicate with device',
-      details: error.message 
-    });
-  }
+  // Send turn_off command via MQTT and wait for response
+  sendMQTTCommand(deviceId, 'turn_off', res);
 });
 
 // Health check endpoint
@@ -227,6 +292,7 @@ app.get('/health', (req, res) => {
   const deviceList = Array.from(devices.values()).map(d => ({
     id: d.id,
     status: d.status,
+    online: d.online,
     lastSeen: d.lastSeen,
     timeSinceLastSeen: new Date() - d.lastSeen
   }));
@@ -234,7 +300,9 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
     timestamp: new Date(),
-    connectedDevices: devices.size,
+    mqttConnected: mqttClient.connected,
+    connectedDevices: Array.from(devices.values()).filter(d => d.online).length,
+    totalDevices: devices.size,
     devices: Array.from(devices.keys()),
     deviceDetails: deviceList
   });
@@ -243,24 +311,23 @@ app.get('/health', (req, res) => {
 // Default route
 app.get('/', (req, res) => {
   res.json({
-    message: 'ESP32 Bridge Server',
-    version: '1.0.0',
+    message: 'ESP32 MQTT Bridge Server',
+    version: '2.0.0',
+    mqttBroker: MQTT_BROKER,
+    mqttConnected: mqttClient.connected,
     endpoints: [
-      'POST /api/devices/register - Register a new device',
-      'POST /api/devices/:deviceId/heartbeat - Send device heartbeat',
       'GET /api/devices - List all devices',
-      'GET /api/devices/:deviceId/status - Get device status',
-      'POST /api/devices/:deviceId/on - Turn device on',
-      'POST /api/devices/:deviceId/off - Turn device off',
+      'GET /api/devices/:deviceId/status - Get device status via MQTT',
+      'POST /api/devices/:deviceId/on - Turn device on via MQTT',
+      'POST /api/devices/:deviceId/off - Turn device off via MQTT',
       'GET /health - Health check'
-    ]
+    ],
+    mqttTopics: MQTT_TOPICS
   });
 });
 
 app.listen(PORT, HOST, () => {
   console.log(`Bridge server running on ${HOST}:${PORT}`);
   console.log(`Visit http://${HOST}:${PORT} for API documentation`);
-  console.log('Waiting for ESP32 devices to connect...');
+  console.log('Waiting for ESP32 devices to connect via MQTT...');
 });
-
-

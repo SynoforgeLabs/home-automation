@@ -1,21 +1,35 @@
 #include <WiFi.h>
-#include <WebServer.h>
+#include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <EEPROM.h>
-#include <HTTPClient.h>
+
+// Forward declarations
+void handleTurnOn(String requestId);
+void handleTurnOff(String requestId);
+void handleGetStatus(String requestId);
+void sendRegistration();
+void sendStatus(String requestId = "");
+void sendCommandResponse(String command, String requestId, bool success, String error = "");
 
 // Replace with your network credentials
 const char* ssid = "SLT-Fiber-EYcM6-2.4G";  // Network SSID (name)
 const char* password = "aqua1483";  // Network password
 
-// Bridge server configuration (your laptop's local IP)
-const char* bridgeServerHost = "134.209.97.185";  // Remote bridge server IP  
-const int bridgeServerPort = 3005;  // HTTP port
+// MQTT Configuration
+const char* mqtt_server = "broker.hivemq.com";  // Free public MQTT broker for testing
+const int mqtt_port = 1883;
 const char* deviceId = "esp32-light-controller";
 const char* deviceName = "Living Room Light";
 
-// Initialize the web server on port 80
-WebServer server(80);
+// MQTT Topics
+const char* status_topic = "devices/esp32-light-controller/status";
+const char* heartbeat_topic = "devices/esp32-light-controller/heartbeat";
+const char* command_topic = "devices/esp32-light-controller/commands";
+const char* response_topic = "devices/esp32-light-controller/responses";
+
+// MQTT Client
+WiFiClient espClient;
+PubSubClient client(espClient);
 
 // Variables to store the current state of the light (ON/OFF)
 String lightState = "off";
@@ -29,171 +43,230 @@ const bool saveState = true;
 // EEPROM address to store the state
 const int eepromSize = 1;
 
-// Register this ESP32 with the bridge server via HTTP with retry logic
-void registerWithBridgeServer() {
-  HTTPClient http;
-  String url = "http://" + String(bridgeServerHost) + ":" + String(bridgeServerPort) + "/api/devices/register";
+// Timing variables
+unsigned long lastHeartbeat = 0;
+unsigned long lastReconnect = 0;
+const unsigned long heartbeatInterval = 15000; // 15 seconds
+const unsigned long reconnectInterval = 5000;  // 5 seconds
+
+// Connect to WiFi
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  randomSeed(micros());
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// MQTT message callback
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
   
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(5000); // 5 second timeout for registration
+  String message;
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  Serial.println(message);
+
+  // Parse JSON command
+  DynamicJsonDocument doc(256);
+  DeserializationError error = deserializeJson(doc, message);
   
-  DynamicJsonDocument doc(300);
+  if (error) {
+    Serial.print("Failed to parse JSON: ");
+    Serial.println(error.c_str());
+    return;
+  }
+
+  String command = doc["command"];
+  String requestId = doc["requestId"];
+
+  if (command == "turn_on") {
+    handleTurnOn(requestId);
+  } else if (command == "turn_off") {
+    handleTurnOff(requestId);
+  } else if (command == "get_status") {
+    handleGetStatus(requestId);
+  } else {
+    Serial.println("Unknown command: " + command);
+  }
+}
+
+// Reconnect to MQTT broker
+void reconnect() {
+  // Loop until we're reconnected
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    
+    // Create a random client ID
+    String clientId = "ESP32Client-";
+    clientId += String(random(0xffff), HEX);
+    
+    // Attempt to connect
+    if (client.connect(clientId.c_str())) {
+      Serial.println("connected");
+      
+      // Subscribe to command topic
+      client.subscribe(command_topic);
+      Serial.print("Subscribed to: ");
+      Serial.println(command_topic);
+      
+      // Send device registration message
+      sendRegistration();
+      
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+// Send device registration to MQTT
+void sendRegistration() {
+  DynamicJsonDocument doc(512);
   doc["deviceId"] = deviceId;
   doc["name"] = deviceName;
   doc["ip"] = WiFi.localIP().toString();
-  doc["port"] = 80;
+  doc["status"] = lightState;
+  doc["timestamp"] = millis();
+  doc["type"] = "registration";
   
   String message;
   serializeJson(doc, message);
   
-  int httpResponseCode = http.POST(message);
-  
-  if (httpResponseCode == 200) {
-    String response = http.getString();
-    Serial.println("Successfully registered with bridge server");
-    Serial.println("Response: " + response);
-  } else {
-    Serial.print("Registration failed. HTTP response code: ");
-    Serial.println(httpResponseCode);
-    
-    // Retry registration after 5 seconds
-    delay(5000);
-    Serial.println("Retrying registration...");
-    httpResponseCode = http.POST(message);
-    if (httpResponseCode == 200) {
-      String response = http.getString();
-      Serial.println("Registration retry successful");
-      Serial.println("Response: " + response);
-    } else {
-      Serial.print("Registration retry failed. Code: ");
-      Serial.println(httpResponseCode);
-    }
-  }
-  
-  http.end();
+  client.publish(heartbeat_topic, message.c_str());
+  Serial.println("Registration sent via MQTT");
 }
 
-// Send heartbeat to bridge server via HTTP with retry logic
+// Send heartbeat via MQTT
 void sendHeartbeat() {
-  HTTPClient http;
-  String url = "http://" + String(bridgeServerHost) + ":" + String(bridgeServerPort) + "/api/devices/" + String(deviceId) + "/heartbeat";
-  
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(3000); // 3 second timeout
-  
-  int httpResponseCode = http.POST("{}");
-  
-  if (httpResponseCode == 200) {
-    Serial.println("Heartbeat sent successfully");
-  } else {
-    Serial.print("Heartbeat failed. HTTP response code: ");
-    Serial.println(httpResponseCode);
-    
-    // Retry once after a short delay
-    delay(1000);
-    httpResponseCode = http.POST("{}");
-    if (httpResponseCode == 200) {
-      Serial.println("Heartbeat retry successful");
-    } else {
-      Serial.print("Heartbeat retry also failed. Code: ");
-      Serial.println(httpResponseCode);
-    }
+  if (!client.connected()) {
+    return;
   }
   
-  http.end();
-}
-
-// Function to add CORS headers
-void addCORSHeaders() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
-}
-
-// HTTP endpoint handlers
-void handleStatus() {
-  addCORSHeaders();
+  DynamicJsonDocument doc(512);
+  doc["deviceId"] = deviceId;
+  doc["name"] = deviceName;
+  doc["ip"] = WiFi.localIP().toString();
+  doc["status"] = lightState;
+  doc["timestamp"] = millis();
+  doc["type"] = "heartbeat";
+  doc["relay_pin"] = LIGHT_RELAY_PIN;
   
-  DynamicJsonDocument doc(200);
+  String message;
+  serializeJson(doc, message);
+  
+  if (client.publish(heartbeat_topic, message.c_str())) {
+    Serial.println("Heartbeat sent via MQTT");
+  } else {
+    Serial.println("Failed to send heartbeat");
+  }
+}
+
+// Send status via MQTT
+void sendStatus(String requestId = "") {
+  DynamicJsonDocument doc(512);
+  doc["deviceId"] = deviceId;
   doc["status"] = lightState;
   doc["relay_pin"] = LIGHT_RELAY_PIN;
   doc["ip_address"] = WiFi.localIP().toString();
+  doc["timestamp"] = millis();
+  doc["type"] = "status";
   
-  String response;
-  serializeJson(doc, response);
+  if (requestId != "") {
+    doc["requestId"] = requestId;
+  }
   
-  server.send(200, "application/json", response);
-  Serial.println("HTTP GET /status - returned: " + response);
+  String message;
+  serializeJson(doc, message);
+  
+  const char* topic = (requestId != "") ? response_topic : status_topic;
+  
+  if (client.publish(topic, message.c_str())) {
+    Serial.println("Status sent via MQTT to " + String(topic));
+  } else {
+    Serial.println("Failed to send status");
+  }
 }
 
-void handleTurnOn() {
-  addCORSHeaders();
+// Send command response via MQTT
+void sendCommandResponse(String command, String requestId, bool success, String error = "") {
+  DynamicJsonDocument doc(512);
+  doc["deviceId"] = deviceId;
+  doc["command"] = command;
+  doc["requestId"] = requestId;
+  doc["success"] = success;
+  doc["status"] = lightState;
+  doc["timestamp"] = millis();
   
-  Serial.println("HTTP POST /on - Light turning ON");
+  if (error != "") {
+    doc["error"] = error;
+  }
+  
+  String message;
+  serializeJson(doc, message);
+  
+  if (client.publish(response_topic, message.c_str())) {
+    Serial.println("Command response sent via MQTT");
+  } else {
+    Serial.println("Failed to send command response");
+  }
+}
+
+// Handle turn on command
+void handleTurnOn(String requestId) {
+  Serial.println("MQTT Command: Light turning ON");
   lightState = "on";
-  digitalWrite(LIGHT_RELAY_PIN, HIGH);  // HIGH turns relay ON (corrected logic)
+  digitalWrite(LIGHT_RELAY_PIN, HIGH);  // HIGH turns relay ON
   
   if (saveState) {
     EEPROM.write(0, 1);
     EEPROM.commit();
   }
   
-  DynamicJsonDocument doc(150);
-  doc["status"] = lightState;
-  doc["message"] = "Light turned ON";
-  doc["ip_address"] = WiFi.localIP().toString();
-  
-  String response;
-  serializeJson(doc, response);
-  
-  server.send(200, "application/json", response);
-  Serial.println("HTTP Response: " + response);
+  sendCommandResponse("turn_on", requestId, true);
+  sendStatus(); // Also broadcast status update
+  Serial.println("Light turned ON via MQTT");
 }
 
-void handleTurnOff() {
-  addCORSHeaders();
-  
-  Serial.println("HTTP POST /off - Light turning OFF");
+// Handle turn off command
+void handleTurnOff(String requestId) {
+  Serial.println("MQTT Command: Light turning OFF");
   lightState = "off";
-  digitalWrite(LIGHT_RELAY_PIN, LOW); // LOW turns relay OFF (corrected logic)
+  digitalWrite(LIGHT_RELAY_PIN, LOW); // LOW turns relay OFF
   
   if (saveState) {
     EEPROM.write(0, 0);
     EEPROM.commit();
   }
   
-  DynamicJsonDocument doc(150);
-  doc["status"] = lightState;
-  doc["message"] = "Light turned OFF";
-  doc["ip_address"] = WiFi.localIP().toString();
-  
-  String response;
-  serializeJson(doc, response);
-  
-  server.send(200, "application/json", response);
-  Serial.println("HTTP Response: " + response);
+  sendCommandResponse("turn_off", requestId, true);
+  sendStatus(); // Also broadcast status update
+  Serial.println("Light turned OFF via MQTT");
 }
 
-void handleOptions() {
-  addCORSHeaders();
-  server.send(200, "text/plain", "");
+// Handle get status command
+void handleGetStatus(String requestId) {
+  Serial.println("MQTT Command: Get status");
+  sendStatus(requestId);
 }
-
-void handleNotFound() {
-  addCORSHeaders();
-  
-  DynamicJsonDocument doc(200);
-  doc["error"] = "Endpoint not found";
-  doc["available_endpoints"] = "[GET /status, POST /on, POST /off]";
-  
-  String response;
-  serializeJson(doc, response);
-  
-  server.send(404, "application/json", response);
-}
-
 
 void setup() {
   Serial.begin(115200);
@@ -203,7 +276,7 @@ void setup() {
     EEPROM.begin(eepromSize);
   }
 
-  // Initialize the GPIO pin for the light relay as output and set to LOW (OFF state)
+  // Initialize the GPIO pin for the light relay as output
   pinMode(LIGHT_RELAY_PIN, OUTPUT);
   
   // Load saved state from EEPROM
@@ -211,64 +284,46 @@ void setup() {
     lightState = EEPROM.read(0) == 1 ? "on" : "off";
   }
 
-  // Set initial relay state (corrected logic: HIGH=ON, LOW=OFF)
+  // Set initial relay state
   digitalWrite(LIGHT_RELAY_PIN, lightState == "on" ? HIGH : LOW);
   
   Serial.print("Light initial state: ");
   Serial.println(lightState);
 
   // Connect to Wi-Fi
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.println("WiFi connected.");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-
-  // Setup HTTP server routes
-  server.on("/status", HTTP_GET, handleStatus);
-  server.on("/on", HTTP_POST, handleTurnOn);
-  server.on("/off", HTTP_POST, handleTurnOff);
-  server.on("/", HTTP_OPTIONS, handleOptions);
-  server.on("/status", HTTP_OPTIONS, handleOptions);
-  server.on("/on", HTTP_OPTIONS, handleOptions);
-  server.on("/off", HTTP_OPTIONS, handleOptions);
-  server.onNotFound(handleNotFound);
+  setup_wifi();
   
-  // Start the HTTP server
-  server.begin();
-  Serial.println("HTTP server started");
-  Serial.println("Available endpoints:");
-  Serial.println("  GET  /status - Get current light status");
-  Serial.println("  POST /on     - Turn light ON");
-  Serial.println("  POST /off    - Turn light OFF");
+  // Setup MQTT
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
   
-  // Register with bridge server via HTTP
-  delay(2000); // Wait a bit for WiFi to fully stabilize
-  registerWithBridgeServer();
-  
-  Serial.print("Registered with bridge server at: ");
-  Serial.print(bridgeServerHost);
-  Serial.print(":");
-  Serial.println(bridgeServerPort);
+  Serial.println("ESP32 MQTT Light Controller started");
+  Serial.println("MQTT Topics:");
+  Serial.println("  Subscribe: " + String(command_topic));
+  Serial.println("  Publish Status: " + String(status_topic));
+  Serial.println("  Publish Heartbeat: " + String(heartbeat_topic));
+  Serial.println("  Publish Responses: " + String(response_topic));
 }
 
 void loop() {
-  // Handle HTTP server requests
-  server.handleClient();
-  
-  // Send heartbeat every 15 seconds (more frequent for better connection monitoring)
-  static unsigned long lastHeartbeat = 0;
-  if (millis() - lastHeartbeat > 15000) {
-    sendHeartbeat();
-    lastHeartbeat = millis();
+  // Ensure MQTT connection
+  if (!client.connected()) {
+    unsigned long now = millis();
+    if (now - lastReconnect > reconnectInterval) {
+      lastReconnect = now;
+      reconnect();
+    }
+  } else {
+    client.loop();
+    
+    // Send periodic heartbeat
+    unsigned long now = millis();
+    if (now - lastHeartbeat > heartbeatInterval) {
+      sendHeartbeat();
+      lastHeartbeat = now;
+    }
   }
   
   // Small delay to prevent overwhelming the CPU
-  delay(10);
+  delay(100);
 }
