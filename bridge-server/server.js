@@ -144,16 +144,35 @@ function handleCommandResponse(deviceId, data) {
     clearTimeout(timeout);
     pendingRequests.delete(requestId);
     
-    if (data.success) {
-      res.json({
+    // Check if this is an error response (has error field) or successful response
+    const isSuccess = !data.error && (data.success !== false);
+    
+    if (isSuccess) {
+      // Build response based on message type
+      const response = {
         device: {
           id: deviceId,
           status: data.status
         },
-        command: data.command,
         timestamp: data.timestamp,
         success: true
-      });
+      };
+      
+      // Add command field if present (for control commands)
+      if (data.command) {
+        response.command = data.command;
+      }
+      
+      // For status requests, include ESP32 data
+      if (data.type === 'status') {
+        response.esp32 = {
+          status: data.status,
+          relay_pin: data.relay_pin,
+          ip_address: data.ip_address
+        };
+      }
+      
+      res.json(response);
     } else {
       res.status(500).json({
         error: 'Command failed',
@@ -161,7 +180,7 @@ function handleCommandResponse(deviceId, data) {
       });
     }
     
-    console.log(`📤 Command response sent for request ${requestId}: ${data.success ? 'success' : 'failed'}`);
+    console.log(`📤 Command response sent for request ${requestId}: ${isSuccess ? 'success' : 'failed'}`);
   } else {
     console.log(`⚠ Received response for unknown request: ${requestId}`);
   }
