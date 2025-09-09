@@ -9,8 +9,8 @@ const char* ssid = "SLT-Fiber-EYcM6-2.4G";  // Network SSID (name)
 const char* password = "aqua1483";  // Network password
 
 // Bridge server configuration (your laptop's local IP)
-const char* bridgeServerHost = "192.168.1.7";  // Your laptop's local IP on same network  
-const int bridgeServerPort = 3000;  // HTTP port
+const char* bridgeServerHost = "134.209.97.185";  // Remote bridge server IP  
+const int bridgeServerPort = 3005;  // HTTP port
 const char* deviceId = "esp32-light-controller";
 const char* deviceName = "Living Room Light";
 
@@ -29,13 +29,14 @@ const bool saveState = true;
 // EEPROM address to store the state
 const int eepromSize = 1;
 
-// Register this ESP32 with the bridge server via HTTP
+// Register this ESP32 with the bridge server via HTTP with retry logic
 void registerWithBridgeServer() {
   HTTPClient http;
   String url = "http://" + String(bridgeServerHost) + ":" + String(bridgeServerPort) + "/api/devices/register";
   
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
+  http.setTimeout(5000); // 5 second timeout for registration
   
   DynamicJsonDocument doc(300);
   doc["deviceId"] = deviceId;
@@ -55,18 +56,32 @@ void registerWithBridgeServer() {
   } else {
     Serial.print("Registration failed. HTTP response code: ");
     Serial.println(httpResponseCode);
+    
+    // Retry registration after 5 seconds
+    delay(5000);
+    Serial.println("Retrying registration...");
+    httpResponseCode = http.POST(message);
+    if (httpResponseCode == 200) {
+      String response = http.getString();
+      Serial.println("Registration retry successful");
+      Serial.println("Response: " + response);
+    } else {
+      Serial.print("Registration retry failed. Code: ");
+      Serial.println(httpResponseCode);
+    }
   }
   
   http.end();
 }
 
-// Send heartbeat to bridge server via HTTP
+// Send heartbeat to bridge server via HTTP with retry logic
 void sendHeartbeat() {
   HTTPClient http;
   String url = "http://" + String(bridgeServerHost) + ":" + String(bridgeServerPort) + "/api/devices/" + String(deviceId) + "/heartbeat";
   
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
+  http.setTimeout(3000); // 3 second timeout
   
   int httpResponseCode = http.POST("{}");
   
@@ -75,6 +90,16 @@ void sendHeartbeat() {
   } else {
     Serial.print("Heartbeat failed. HTTP response code: ");
     Serial.println(httpResponseCode);
+    
+    // Retry once after a short delay
+    delay(1000);
+    httpResponseCode = http.POST("{}");
+    if (httpResponseCode == 200) {
+      Serial.println("Heartbeat retry successful");
+    } else {
+      Serial.print("Heartbeat retry also failed. Code: ");
+      Serial.println(httpResponseCode);
+    }
   }
   
   http.end();
@@ -237,9 +262,9 @@ void loop() {
   // Handle HTTP server requests
   server.handleClient();
   
-  // Send heartbeat every 30 seconds
+  // Send heartbeat every 15 seconds (more frequent for better connection monitoring)
   static unsigned long lastHeartbeat = 0;
-  if (millis() - lastHeartbeat > 30000) {
+  if (millis() - lastHeartbeat > 15000) {
     sendHeartbeat();
     lastHeartbeat = millis();
   }

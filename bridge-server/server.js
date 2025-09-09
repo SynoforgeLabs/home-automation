@@ -77,7 +77,7 @@ app.post('/api/devices/:deviceId/heartbeat', (req, res) => {
 // Clean up offline devices periodically
 setInterval(() => {
   const now = new Date();
-  const TIMEOUT = 60000; // 1 minute timeout
+  const TIMEOUT = 45000; // 45 second timeout (3x heartbeat interval for better stability)
   
   for (const [deviceId, device] of devices.entries()) {
     const timeSinceLastSeen = now - device.lastSeen;
@@ -85,8 +85,12 @@ setInterval(() => {
       console.log(`⚠ Device ${deviceId} marked as offline (no heartbeat for ${Math.round(timeSinceLastSeen/1000)}s)`);
       device.status = 'offline';
     }
+    // Mark as error if offline for too long
+    else if (timeSinceLastSeen > TIMEOUT * 2 && device.status === 'offline') {
+      device.status = 'error';
+    }
   }
-}, 30000); // Check every 30 seconds
+}, 20000); // Check every 20 seconds (less frequent to reduce race conditions)
 
 // REST API Routes
 
@@ -113,12 +117,13 @@ app.get('/api/devices/:deviceId/status', async (req, res) => {
     return res.status(404).json({ error: 'Device not found' });
   }
   
-  if (device.status !== 'online') {
+  // Allow requests to devices marked as 'offline' but not 'error' (more forgiving)
+  if (device.status === 'error') {
     return res.status(503).json({ error: 'Device is offline' });
   }
   
   try {
-    // Forward request to ESP32
+    // Forward request to ESP32 with longer timeout for better reliability
     const response = await axios.get(`http://${device.ip}:${device.port}/status`, {
       timeout: 5000
     });
@@ -150,12 +155,13 @@ app.post('/api/devices/:deviceId/on', async (req, res) => {
     return res.status(404).json({ error: 'Device not found' });
   }
   
-  if (device.status !== 'online') {
+  // Allow requests to devices marked as 'offline' but not 'error' (more forgiving)
+  if (device.status === 'error') {
     return res.status(503).json({ error: 'Device is offline' });
   }
   
   try {
-    // Forward request to ESP32
+    // Forward request to ESP32 with longer timeout for better reliability
     const response = await axios.post(`http://${device.ip}:${device.port}/on`, {}, {
       timeout: 5000
     });
@@ -187,12 +193,13 @@ app.post('/api/devices/:deviceId/off', async (req, res) => {
     return res.status(404).json({ error: 'Device not found' });
   }
   
-  if (device.status !== 'online') {
+  // Allow requests to devices marked as 'offline' but not 'error' (more forgiving)
+  if (device.status === 'error') {
     return res.status(503).json({ error: 'Device is offline' });
   }
   
   try {
-    // Forward request to ESP32
+    // Forward request to ESP32 with longer timeout for better reliability
     const response = await axios.post(`http://${device.ip}:${device.port}/off`, {}, {
       timeout: 5000
     });
