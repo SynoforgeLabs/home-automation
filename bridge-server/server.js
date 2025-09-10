@@ -12,6 +12,7 @@ const MQTT_TOPICS = {
   DEVICE_HEARTBEAT: 'devices/+/heartbeat',
   DEVICE_STATUS: 'devices/+/status', 
   DEVICE_RESPONSES: 'devices/+/responses',
+  DEVICE_AUDIO: 'devices/+/audio',
   DEVICE_COMMANDS: 'devices/esp32-light-controller/commands'
 };
 
@@ -92,6 +93,9 @@ mqttClient.on('message', (topic, message) => {
       case 'responses':
         handleCommandResponse(deviceId, data);
         break;
+      case 'audio':
+        handleAudioEvent(deviceId, data);
+        break;
       default:
         console.log(`Unknown message type: ${messageType}`);
     }
@@ -112,17 +116,39 @@ function handleHeartbeat(deviceId, data) {
     status: data.status || 'on',
     lastSeen: now,
     online: true,
-    relayPin: data.relay_pin
+    relayPin: data.relay_pin,
+    // Enhanced audio/voice capabilities tracking
+    voiceEnabled: data.voice_enabled || false,
+    audioPins: data.audio_pins || null,
+    capabilities: data.capabilities || []
   };
   
   devices.set(deviceId, deviceInfo);
   
   if (data.type === 'registration') {
     console.log(`📝 Device registered: ${deviceId} (${data.name}) at ${data.ip}`);
+    if (data.capabilities) {
+      console.log(`   Capabilities: ${data.capabilities.join(', ')}`);
+    }
+    if (data.voice_enabled) {
+      console.log(`   🎤 Voice commands: ${data.voice_enabled ? 'Enabled' : 'Disabled'}`);
+    }
   } else if (!existingDevice || !existingDevice.online) {
     console.log(`✓ Device ${deviceId} is online`);
   } else {
-    console.log(`♡ Heartbeat from ${deviceId}`);
+    console.log(`♡ Heartbeat from ${deviceId} (voice: ${data.voice_enabled ? 'on' : 'off'})`);
+  }
+}
+
+// Handle audio/voice events from devices
+function handleAudioEvent(deviceId, data) {
+  const device = devices.get(deviceId);
+  if (device) {
+    device.lastSeen = new Date();
+    console.log(`🎤 Voice command from ${deviceId}: "${data.voiceCommand}" → ${data.action} (${data.source || 'voice'})`);
+    
+    // You could store voice command history, analytics, etc. here
+    // For now, just log the event
   }
 }
 
@@ -262,7 +288,10 @@ app.get('/api/devices', (req, res) => {
     ip: d.ip,
     status: d.status,
     online: d.online,
-    lastSeen: d.lastSeen
+    lastSeen: d.lastSeen,
+    voiceEnabled: d.voiceEnabled,
+    capabilities: d.capabilities,
+    audioPins: d.audioPins
   }));
   
   res.json({ devices: deviceList });
@@ -319,6 +348,40 @@ app.post('/api/devices/:deviceId/off', (req, res) => {
   sendMQTTCommand(deviceId, 'turn_off', res);
 });
 
+// Voice control - enable voice detection
+app.post('/api/devices/:deviceId/voice/enable', (req, res) => {
+  const deviceId = req.params.deviceId;
+  const device = devices.get(deviceId);
+  
+  if (!device) {
+    return res.status(404).json({ error: 'Device not found' });
+  }
+  
+  if (!device.online) {
+    return res.status(503).json({ error: 'Device is offline' });
+  }
+  
+  // Send enable_voice command via MQTT and wait for response
+  sendMQTTCommand(deviceId, 'enable_voice', res);
+});
+
+// Voice control - disable voice detection
+app.post('/api/devices/:deviceId/voice/disable', (req, res) => {
+  const deviceId = req.params.deviceId;
+  const device = devices.get(deviceId);
+  
+  if (!device) {
+    return res.status(404).json({ error: 'Device not found' });
+  }
+  
+  if (!device.online) {
+    return res.status(503).json({ error: 'Device is offline' });
+  }
+  
+  // Send disable_voice command via MQTT and wait for response
+  sendMQTTCommand(deviceId, 'disable_voice', res);
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   const deviceList = Array.from(devices.values()).map(d => ({
@@ -352,6 +415,8 @@ app.get('/', (req, res) => {
       'GET /api/devices/:deviceId/status - Get device status via MQTT',
       'POST /api/devices/:deviceId/on - Turn device on via MQTT',
       'POST /api/devices/:deviceId/off - Turn device off via MQTT',
+      'POST /api/devices/:deviceId/voice/enable - Enable voice detection',
+      'POST /api/devices/:deviceId/voice/disable - Disable voice detection',
       'GET /health - Health check'
     ],
     mqttTopics: MQTT_TOPICS

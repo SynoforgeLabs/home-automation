@@ -1,200 +1,271 @@
-
-
-Search
-Write
-Sign up
-
-Sign in
-
-
-
-
-Writing is for everyone.Register for Medium Day
-
-
-Building an MQTT-Controlled Relay System with ESP32
-Tomer Klein
-Tomer Klein
-
-Follow
-5 min read
-·
-Jul 14, 2024
-1
-
-
-
-
-Introduction
-In this guide, we’ll explore how to control relays using an ESP32 microcontroller and MQTT protocol. MQTT is a lightweight messaging protocol ideal for IoT applications, allowing devices to communicate efficiently. We’ll also ensure that relay states are preserved in case of a power failure, making your smart home automation system more reliable.
-
-Requirements
-Hardware
-ESP32 microcontroller
-6-Relay module
-Wi-Fi network
-Software
-Arduino IDE
-PubSubClient library for MQTT
-WiFi library for ESP32
-MQTT broker (e.g., Mosquitto)
-How-To Guide
-1. Setting Up the Hardware
-Connect your ESP32 to the 6-relay module using the following GPIO pins:
-
-Relay 1: GPIO 4
-Relay 2: GPIO 5
-Relay 3: GPIO 18
-Relay 4: GPIO 19
-Get Tomer Klein’s stories in your inbox
-Join Medium for free to get updates from this writer.
-
-Enter your email
-Subscribe
-Relay 5: GPIO 21
-Relay 6: GPIO 22
-Ensure the relays are connected correctly and powered adequately.
-
-2. Installing Required Libraries
-In the Arduino IDE, install the following libraries:
-
-PubSubClient
-WiFi
-3. Writing the Code
-Here is the complete code for controlling the relays over MQTT and saving their state:
-
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <ArduinoJson.h>
 #include <EEPROM.h>
 
+// Forward declarations
+void handleTurnOn(String requestId);
+void handleTurnOff(String requestId);
+void handleGetStatus(String requestId);
+void sendRegistration();
+void sendStatus(String requestId);
+void sendCommandResponse(String command, String requestId, bool success, String error);
+
 // Replace with your network credentials
-const char* ssid = "******";  // Network SSID (name)
-const char* password = "******";  // Network password
+const char* ssid = "SLT-Fiber-EYcM6-2.4G";  // Network SSID (name)
+const char* password = "aqua1483";  // Network password
 
-// MQTT Broker details
-const char* mqttServer = "******";
-const int mqttPort = 1883;
-const char* mqttUser = "******";
-const char* mqttPassword = "******";
+// MQTT Configuration
+const char* mqtt_server = "broker.hivemq.com";  // Free public MQTT broker for testing
+const int mqtt_port = 1883;
+const char* deviceId = "esp32-light-controller";
+const char* deviceName = "Living Room Light";
 
-// Initialize the WiFi and MQTT client objects
+// MQTT Topics
+const char* status_topic = "devices/esp32-light-controller/status";
+const char* heartbeat_topic = "devices/esp32-light-controller/heartbeat";
+const char* command_topic = "devices/esp32-light-controller/commands";
+const char* response_topic = "devices/esp32-light-controller/responses";
+
+// MQTT Client
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// Variables to store the current state of each device (ON/OFF)
-String Device1State = "off";
-String Device2State = "off";
-String Device3State = "off";
-String Device4State = "off";
-String Device5State = "off";
-String Device6State = "off";
+// Variables to store the current state of the light (ON/OFF)
+String lightState = "off";
 
-// Assign each device to a GPIO pin
-const int Device1 = 4;
-const int Device2 = 5;
-const int Device3 = 18;
-const int Device4 = 19;
-const int Device5 = 21;
-const int Device6 = 22;
+// Assign the light relay to a GPIO pin
+const int LIGHT_RELAY_PIN = 4;  // GPIO 4 for the light relay
 
 // Variable to enable or disable state saving
 const bool saveState = true;
 
 // EEPROM address to store the state
-const int eepromSize = 6;
+const int eepromSize = 1;
 
-// Callback function for MQTT subscription
-void callback(char* topic, byte* message, unsigned int length) {
-  String messageTemp;
-  
-  for (int i = 0; i < length; i++) {
-    messageTemp += (char)message[i];
+// Timing variables
+unsigned long lastHeartbeat = 0;
+unsigned long lastReconnect = 0;
+const unsigned long heartbeatInterval = 15000; // 15 seconds
+const unsigned long reconnectInterval = 5000;  // 5 seconds
+
+// Connect to WiFi
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
   }
 
-  // Print the message for debugging
-  Serial.print("Message arrived on topic: ");
+  randomSeed(micros());
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// MQTT message callback
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived [");
   Serial.print(topic);
-  Serial.print(". Message: ");
-  Serial.println(messageTemp);
+  Serial.print("] ");
+  
+  String message;
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  Serial.println(message);
 
-  // Check the received message and update the corresponding relay state
-  if (String(topic) == "relay/device1") {
-    if (messageTemp == "on") {
-      Serial.println("Device 1 on");
-      Device1State = "on";
-      digitalWrite(Device1, LOW);
-      if (saveState) EEPROM.write(0, 1);
-    } else if (messageTemp == "off") {
-      Serial.println("Device 1 off");
-      Device1State = "off";
-      digitalWrite(Device1, HIGH);
-      if (saveState) EEPROM.write(0, 0);
-    }
-  } else if (String(topic) == "relay/device2") {
-    if (messageTemp == "on") {
-      Serial.println("Device 2 on");
-      Device2State = "on";
-      digitalWrite(Device2, LOW);
-      if (saveState) EEPROM.write(1, 1);
-    } else if (messageTemp == "off") {
-      Serial.println("Device 2 off");
-      Device2State = "off";
-      digitalWrite(Device2, HIGH);
-      if (saveState) EEPROM.write(1, 0);
-    }
-  } else if (String(topic) == "relay/device3") {
-    if (messageTemp == "on") {
-      Serial.println("Device 3 on");
-      Device3State = "on";
-      digitalWrite(Device3, LOW);
-      if (saveState) EEPROM.write(2, 1);
-    } else if (messageTemp == "off") {
-      Serial.println("Device 3 off");
-      Device3State = "off";
-      digitalWrite(Device3, HIGH);
-      if (saveState) EEPROM.write(2, 0);
-    }
-  } else if (String(topic) == "relay/device4") {
-    if (messageTemp == "on") {
-      Serial.println("Device 4 on");
-      Device4State = "on";
-      digitalWrite(Device4, LOW);
-      if (saveState) EEPROM.write(3, 1);
-    } else if (messageTemp == "off") {
-      Serial.println("Device 4 off");
-      Device4State = "off";
-      digitalWrite(Device4, HIGH);
-      if (saveState) EEPROM.write(3, 0);
-    }
-  } else if (String(topic) == "relay/device5") {
-    if (messageTemp == "on") {
-      Serial.println("Device 5 on");
-      Device5State = "on";
-      digitalWrite(Device5, LOW);
-      if (saveState) EEPROM.write(4, 1);
-    } else if (messageTemp == "off") {
-      Serial.println("Device 5 off");
-      Device5State = "off";
-      digitalWrite(Device5, HIGH);
-      if (saveState) EEPROM.write(4, 0);
-    }
-  } else if (String(topic) == "relay/device6") {
-    if (messageTemp == "on") {
-      Serial.println("Device 6 on");
-      Device6State = "on";
-      digitalWrite(Device6, LOW);
-      if (saveState) EEPROM.write(5, 1);
-    } else if (messageTemp == "off") {
-      Serial.println("Device 6 off");
-      Device6State = "off";
-      digitalWrite(Device6, HIGH);
-      if (saveState) EEPROM.write(5, 0);
-    }
+  // Parse JSON command
+  DynamicJsonDocument doc(256);
+  DeserializationError error = deserializeJson(doc, message);
+  
+  if (error) {
+    Serial.print("Failed to parse JSON: ");
+    Serial.println(error.c_str());
+    return;
   }
 
+  String command = doc["command"];
+  String requestId = doc["requestId"];
+
+  if (command == "turn_on") {
+    handleTurnOn(requestId);
+  } else if (command == "turn_off") {
+    handleTurnOff(requestId);
+  } else if (command == "get_status") {
+    handleGetStatus(requestId);
+  } else {
+    Serial.println("Unknown command: " + command);
+  }
+}
+
+// Reconnect to MQTT broker
+void reconnect() {
+  // Loop until we're reconnected
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    
+    // Create a random client ID
+    String clientId = "ESP32Client-";
+    clientId += String(random(0xffff), HEX);
+    
+    // Attempt to connect
+    if (client.connect(clientId.c_str())) {
+      Serial.println("connected");
+      
+      // Subscribe to command topic
+      client.subscribe(command_topic);
+      Serial.print("Subscribed to: ");
+      Serial.println(command_topic);
+      
+      // Send device registration message
+      sendRegistration();
+      
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+// Send device registration to MQTT
+void sendRegistration() {
+  DynamicJsonDocument doc(512);
+  doc["deviceId"] = deviceId;
+  doc["name"] = deviceName;
+  doc["ip"] = WiFi.localIP().toString();
+  doc["status"] = lightState;
+  doc["timestamp"] = millis();
+  doc["type"] = "registration";
+  
+  String message;
+  serializeJson(doc, message);
+  
+  client.publish(heartbeat_topic, message.c_str());
+  Serial.println("Registration sent via MQTT");
+}
+
+// Send heartbeat via MQTT
+void sendHeartbeat() {
+  if (!client.connected()) {
+    return;
+  }
+  
+  DynamicJsonDocument doc(512);
+  doc["deviceId"] = deviceId;
+  doc["name"] = deviceName;
+  doc["ip"] = WiFi.localIP().toString();
+  doc["status"] = lightState;
+  doc["timestamp"] = millis();
+  doc["type"] = "heartbeat";
+  doc["relay_pin"] = LIGHT_RELAY_PIN;
+  
+  String message;
+  serializeJson(doc, message);
+  
+  if (client.publish(heartbeat_topic, message.c_str())) {
+    Serial.println("Heartbeat sent via MQTT");
+  } else {
+    Serial.println("Failed to send heartbeat");
+  }
+}
+
+// Send status via MQTT
+void sendStatus(String requestId = "") {
+  DynamicJsonDocument doc(512);
+  doc["deviceId"] = deviceId;
+  doc["status"] = lightState;
+  doc["relay_pin"] = LIGHT_RELAY_PIN;
+  doc["ip_address"] = WiFi.localIP().toString();
+  doc["timestamp"] = millis();
+  doc["type"] = "status";
+  
+  if (requestId != "") {
+    doc["requestId"] = requestId;
+  }
+  
+  String message;
+  serializeJson(doc, message);
+  
+  const char* topic = (requestId != "") ? response_topic : status_topic;
+  
+  if (client.publish(topic, message.c_str())) {
+    Serial.println("Status sent via MQTT to " + String(topic));
+  } else {
+    Serial.println("Failed to send status");
+  }
+}
+
+// Send command response via MQTT
+void sendCommandResponse(String command, String requestId, bool success, String error = "") {
+  DynamicJsonDocument doc(512);
+  doc["deviceId"] = deviceId;
+  doc["command"] = command;
+  doc["requestId"] = requestId;
+  doc["success"] = success;
+  doc["status"] = lightState;
+  doc["timestamp"] = millis();
+  
+  if (error != "") {
+    doc["error"] = error;
+  }
+  
+  String message;
+  serializeJson(doc, message);
+  
+  if (client.publish(response_topic, message.c_str())) {
+    Serial.println("Command response sent via MQTT");
+  } else {
+    Serial.println("Failed to send command response");
+  }
+}
+
+// Handle turn on command
+void handleTurnOn(String requestId) {
+  Serial.println("MQTT Command: Light turning ON");
+  lightState = "on";
+  digitalWrite(LIGHT_RELAY_PIN, HIGH);  // HIGH turns relay ON
+  
   if (saveState) {
+    EEPROM.write(0, 1);
     EEPROM.commit();
   }
+  
+  sendCommandResponse("turn_on", requestId, true, "");
+  sendStatus(""); // Also broadcast status update
+  Serial.println("Light turned ON via MQTT");
+}
+
+// Handle turn off command
+void handleTurnOff(String requestId) {
+  Serial.println("MQTT Command: Light turning OFF");
+  lightState = "off";
+  digitalWrite(LIGHT_RELAY_PIN, LOW); // LOW turns relay OFF
+  
+  if (saveState) {
+    EEPROM.write(0, 0);
+    EEPROM.commit();
+  }
+  
+  sendCommandResponse("turn_off", requestId, true, "");
+  sendStatus(""); // Also broadcast status update
+  Serial.println("Light turned OFF via MQTT");
+}
+
+// Handle get status command
+void handleGetStatus(String requestId) {
+  Serial.println("MQTT Command: Get status");
+  sendStatus(requestId);
 }
 
 void setup() {
@@ -205,248 +276,54 @@ void setup() {
     EEPROM.begin(eepromSize);
   }
 
-  // Initialize the GPIO pins for the devices as outputs and set them to HIGH (NC state)
-  pinMode(Device1, OUTPUT);
-  pinMode(Device2, OUTPUT);
-  pinMode(Device3, OUTPUT);
-  pinMode(Device4, OUTPUT);
-  pinMode(Device5, OUTPUT);
-  pinMode(Device6, OUTPUT);
+  // Initialize the GPIO pin for the light relay as output
+  pinMode(LIGHT_RELAY_PIN, OUTPUT);
   
-  // Load saved states from EEPROM
+  // Load saved state from EEPROM
   if (saveState) {
-    Device1State = EEPROM.read(0) == 1 ? "on" : "off";
-    Device2State = EEPROM.read(1) == 1 ? "on" : "off";
-    Device3State = EEPROM.read(2) == 1 ? "on" : "off";
-    Device4State = EEPROM.read(3) == 1 ? "on" : "off";
-    Device5State = EEPROM.read(4) == 1 ? "on" : "off";
-    Device6State = EEPROM.read(5) == 1 ? "on" : "off";
+    lightState = EEPROM.read(0) == 1 ? "on" : "off";
   }
 
-  // Set initial relay states
-  digitalWrite(Device1, Device1State == "on" ? LOW : HIGH);
-  digitalWrite(Device2, Device2State == "on" ? LOW : HIGH);
-  digitalWrite(Device3, Device3State == "on" ? LOW : HIGH);
-  digitalWrite(Device4, Device4State == "on" ? LOW : HIGH);
-  digitalWrite(Device5, Device5State == "on" ? LOW : HIGH);
-  digitalWrite(Device6, Device6State == "on" ? LOW : HIGH);
+  // Set initial relay state
+  digitalWrite(LIGHT_RELAY_PIN, lightState == "on" ? HIGH : LOW);
+  
+  Serial.print("Light initial state: ");
+  Serial.println(lightState);
 
   // Connect to Wi-Fi
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.println("WiFi connected.");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-
-  // Connect to MQTT Broker
-  client.setServer(mqttServer, mqttPort);
+  setup_wifi();
+  
+  // Setup MQTT
+  client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
-
-  while (!client.connected()) {
-    Serial.println("Connecting to MQTT...");
-    if (client.connect("ESP32Client", mqttUser, mqttPassword)) {
-      Serial.println("connected");
-    } else {
-      Serial.print("failed with state ");
-      Serial.print(client.state());
-      delay(2000);
-    }
-  }
-
-  // Subscribe to topics
-  client.subscribe("relay/device1");
-  client.subscribe("relay/device2");
-  client.subscribe("relay/device3");
-  client.subscribe("relay/device4");
-  client.subscribe("relay/device5");
-  client.subscribe("relay/device6");
+  
+  Serial.println("ESP32 MQTT Light Controller started");
+  Serial.println("MQTT Topics:");
+  Serial.println("  Subscribe: " + String(command_topic));
+  Serial.println("  Publish Status: " + String(status_topic));
+  Serial.println("  Publish Heartbeat: " + String(heartbeat_topic));
+  Serial.println("  Publish Responses: " + String(response_topic));
 }
 
 void loop() {
-  client.loop();
+  // Ensure MQTT connection
+  if (!client.connected()) {
+    unsigned long now = millis();
+    if (now - lastReconnect > reconnectInterval) {
+      lastReconnect = now;
+      reconnect();
+    }
+  } else {
+    client.loop();
+    
+    // Send periodic heartbeat
+    unsigned long now = millis();
+    if (now - lastHeartbeat > heartbeatInterval) {
+      sendHeartbeat();
+      lastHeartbeat = now;
+    }
+  }
+  
+  // Small delay to prevent overwhelming the CPU
+  delay(100);
 }
-4. Explanation of Code
-Wi-Fi and MQTT Setup: Connect to the Wi-Fi network and MQTT broker.
-Relay Initialization: Initialize relays and set their state based on the saved EEPROM values.
-MQTT Callback: Handle incoming MQTT messages to control relay states.
-State Persistence: Save the state of each relay in EEPROM to recover after a power failure.
-5. Configuring MQTT Broker
-Set up an MQTT broker (e.g., Mosquitto) on your local network or use a cloud-based MQTT broker. Ensure the credentials match the ones in your ESP32 code.
-
-6. Testing the System
-Publish messages to the MQTT topic (e.g., home/relay) with payloads like relay1on, relay2off, etc., to control the relays. Observe the relays' states and their persistence after a power cycle.
-
-Conclusion
-By following this guide, you can set up a robust and reliable MQTT-controlled relay system using an ESP32. The added state persistence ensures your relays maintain their last state even after a power failure, making your home automation system more resilient and dependable.
-
-IoT
-Mqtt
-Home Automation
-Esp32
-Relay Board
-1
-
-
-
-Tomer Klein
-Written by Tomer Klein
-281 followers
-·
-2 following
-🚀 C#/Python Developer crafting IoT magic, fueled by open source passion. Smart homes whisperer, code contributor, and tech explorer. 🌟
-
-
-Follow
-
-No responses yet
-
-Write a response
-
-What are your thoughts?
-
-Cancel
-Respond
-More from Tomer Klein
-Unlocking the Power of Shodan: A Comprehensive Guide for Beginners
-OSINT Team
-In
-
-OSINT Team
-
-by
-
-Tomer Klein
-
-Unlocking the Power of Shodan: A Comprehensive Guide for Beginners
-Introduction
-Oct 29, 2023
-29
-1
-Docker-Compose and Mosquitto MQTT: Simplifying Broker Deployment
-Tomer Klein
-Tomer Klein
-
-Docker-Compose and Mosquitto MQTT: Simplifying Broker Deployment
-Introduction
-Oct 22, 2023
-80
-1
-Step-by-Step Tutorial: Installing Docker and Docker Compose on Ubuntu
-Tomer Klein
-Tomer Klein
-
-Step-by-Step Tutorial: Installing Docker and Docker Compose on Ubuntu
-Introduction
-Oct 22, 2023
-25
-1
-Visualizing Traefik Metrics with Grafana and Prometheus: Step-by-Step
-Tomer Klein
-Tomer Klein
-
-Visualizing Traefik Metrics with Grafana and Prometheus: Step-by-Step
-Introduction
-Oct 20, 2023
-22
-1
-See all from Tomer Klein
-Recommended from Medium
-Chirp Spread Spectrum Communication
-Radio Hackers
-In
-
-Radio Hackers
-
-by
-
-Simon Quellen Field
-
-Python Radio 53: Chirp Spread Spectrum
-Doing It All in Software
-
-3d ago
-154
-1
-Using an external MQTT server as a bridge between Zigbee coordinator and Home Assistant running…
-DevOps Engineer, Software Architect and Software Developering
-In
-
-DevOps Engineer, Software Architect and Software Developering
-
-by
-
-Paris Nakita Kejser
-
-Using an external MQTT server as a bridge between Zigbee coordinator and Home Assistant running…
-One of the biggest challenges when using Home Assistant in Kubernetes is handling hardware access. Since Kubernetes abstracts the…
-Mar 23
-2
-Why Rust Is Gaining Serious Ground in Systems Programming and WebAssembly
-Rustaceans
-In
-
-Rustaceans
-
-by
-
-Maximilian Oliver
-
-Why Rust Is Gaining Serious Ground in Systems Programming and WebAssembly
-My Deep Dive into Performance, Safety, and Modern Dev Ergonomics.
-
-Aug 27
-29
-Simplify Robot Cars using TB6612 Motor Shield
-Jiayi Hoffman
-Jiayi Hoffman
-
-Simplify Robot Cars using TB6612 Motor Shield
-A motor shield is better for robot cars because it simplifies wiring, and makes motor and sensor connections easy.
-Apr 23
-30
-Rethinking the Value of Running Services on the IoT Edge
-Ryan Revilla
-Ryan Revilla
-
-Rethinking the Value of Running Services on the IoT Edge
-A special case that forced me to use a Raspberry Pi to run a service. It made me rethink the value an edge device has.
-
-3d ago
-33
-3
-Docker Is Dead — And It’s About Time
-Abhinav
-Abhinav
-
-Docker Is Dead — And It’s About Time
-Docker changed the game when it launched in 2013, making containers accessible and turning “Dockerize it” into a developer catchphrase.
-
-Jun 9
-5.9K
-158
-See more recommendations
-Help
-
-Status
-
-About
-
-Careers
-
-Press
-
-Blog
-
-Privacy
-
-Rules
-
-Terms
-
-Text to speech
